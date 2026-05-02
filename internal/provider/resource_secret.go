@@ -179,18 +179,27 @@ func (r *ConjurSecretResource) Configure(ctx context.Context, req resource.Confi
 }
 
 func (r *ConjurSecretResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
-	var data ConjurSecretResourceModel
-	resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
+	// Use GetAttribute per-field rather than Get on the whole struct.
+	// req.Config.Get() silently fails to hydrate struct fields when a write-only
+	// attribute (value_wo) is set in the config, leaving them null. Create/Update
+	// already use GetAttribute for value_wo — this method must do the same.
+	var branch, name, value, valueWO types.String
+	var valueWOVersion types.Int32
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("branch"), &branch)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("name"), &name)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("value"), &value)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("value_wo"), &valueWO)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("value_wo_version"), &valueWOVersion)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	ValidateBranch(data.Branch, &resp.Diagnostics, "branch")
-	ValidateNonEmpty(data.Name, &resp.Diagnostics, "Secret name")
+	ValidateBranch(branch, &resp.Diagnostics, "branch")
+	ValidateNonEmpty(name, &resp.Diagnostics, "Secret name")
 
 	// Validate that value and value_wo are mutually exclusive
-	hasValue := !data.Value.IsNull() && !data.Value.IsUnknown()
-	hasValueWO := !data.ValueWO.IsNull() && !data.ValueWO.IsUnknown()
+	hasValue := !value.IsNull() && !value.IsUnknown()
+	hasValueWO := !valueWO.IsNull() && !valueWO.IsUnknown()
 	if hasValue && hasValueWO {
 		resp.Diagnostics.AddError(
 			"Invalid Attribute Combination",
@@ -199,8 +208,8 @@ func (r *ConjurSecretResource) ValidateConfig(ctx context.Context, req resource.
 	}
 
 	// Validate that value_wo_version requires value_wo
-	if !data.ValueWOVersion.IsNull() && !data.ValueWOVersion.IsUnknown() {
-		if data.ValueWO.IsNull() || data.ValueWO.IsUnknown() {
+	if !valueWOVersion.IsNull() && !valueWOVersion.IsUnknown() {
+		if valueWO.IsNull() || valueWO.IsUnknown() {
 			resp.Diagnostics.AddError(
 				"Invalid Attribute Combination",
 				"The 'value_wo_version' attribute requires 'value_wo' to be set. 'value_wo_version' is used together with 'value_wo' to trigger an update.",
