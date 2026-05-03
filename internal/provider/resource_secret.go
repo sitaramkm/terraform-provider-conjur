@@ -235,32 +235,23 @@ func (r *ConjurSecretResource) Create(ctx context.Context, req resource.CreateRe
 		return
 	}
 
-	// Step 1: Declare the variable in the policy branch via the v1 policy API.
-	// This is intentionally identical to how Delete works (ApplyPolicy with a
-	// deletion statement), so both operations go through the same code path.
-	creationPolicy, err := r.generateSecretCreationPolicy(&data)
-	if err != nil {
-		resp.Diagnostics.AddError("Error Building Secret Policy", fmt.Sprintf("Could not build secret creation policy: %s", err))
-		return
-	}
+	// Set the secret value via the v1 secrets API.
+	// The variable must already exist in Conjur (declared by the admin workspace
+	// via `conjur-tf.sh admin-setup`) before a value can be stored.
 	branch := strings.TrimPrefix(data.Branch.ValueString(), "/")
-	if err := policy.ApplyPolicy(r.client, creationPolicy, branch); err != nil {
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to declare secret via policy, got error: %s", err))
-		return
-	}
-
-	// Step 2: Set the secret value via the v1 secrets API.
 	secretID := branch + "/" + data.Name.ValueString()
 	usingValueWO := false
 	if !valueWO.IsNull() {
 		usingValueWO = true
 		if err := r.client.AddSecret(secretID, valueWO.ValueString()); err != nil {
-			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to set secret value, got error: %s", err))
+			resp.Diagnostics.AddError("Client Error",
+				fmt.Sprintf("Unable to set secret %q, got error: %s\n\nHint: run `conjur-tf.sh admin-setup` first to declare variables in the policy branch.", secretID, err))
 			return
 		}
 	} else if !data.Value.IsNull() {
 		if err := r.client.AddSecret(secretID, data.Value.ValueString()); err != nil {
-			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to set secret value, got error: %s", err))
+			resp.Diagnostics.AddError("Client Error",
+				fmt.Sprintf("Unable to set secret %q, got error: %s\n\nHint: run `conjur-tf.sh admin-setup` first to declare variables in the policy branch.", secretID, err))
 			return
 		}
 	}
@@ -417,17 +408,6 @@ func (r *ConjurSecretResource) ImportState(ctx context.Context, req resource.Imp
 
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), name)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("branch"), branch)...)
-}
-
-func (r *ConjurSecretResource) generateSecretCreationPolicy(data *ConjurSecretResourceModel) (string, error) {
-	name := strings.TrimSpace(data.Name.ValueString())
-	v := conjurpolicy.Variable{Id: name}
-	policyStatements := conjurpolicy.PolicyStatements{v}
-	yamlBytes, err := yaml.Marshal(policyStatements)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal creation policy to YAML: %w", err)
-	}
-	return string(yamlBytes), nil
 }
 
 func (r *ConjurSecretResource) generateSecretDeletionPolicy(data *ConjurSecretResourceModel) (string, error) {

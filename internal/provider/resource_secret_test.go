@@ -30,36 +30,6 @@ func TestConjurSecretResource_Schema(t *testing.T) {
 	}
 }
 
-func TestGenerateSecretCreationPolicy(t *testing.T) {
-	r := &ConjurSecretResource{}
-
-	testCases := []struct {
-		name       string
-		secretName string
-	}{
-		{name: "simple name", secretName: "my-secret"},
-		{name: "slash in name", secretName: "path/to/secret"},
-		{name: "special YAML characters", secretName: "secret:value"},
-		{name: "unicode", secretName: "secret-测试-🚀"},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			data := &ConjurSecretResourceModel{Name: types.StringValue(tc.secretName)}
-			policyStr, err := r.generateSecretCreationPolicy(data)
-			require.NoError(t, err)
-
-			var policyStatements conjurpolicy.PolicyStatements
-			require.NoError(t, yaml.Unmarshal([]byte(policyStr), &policyStatements))
-			require.Len(t, policyStatements, 1, "Policy: %s", policyStr)
-
-			varStmt, ok := policyStatements[0].(conjurpolicy.Variable)
-			require.True(t, ok, "Statement should be a Variable. Policy: %s", policyStr)
-			assert.Equal(t, tc.secretName, varStmt.Id)
-		})
-	}
-}
-
 func TestGenerateSecretDeletionPolicy(t *testing.T) {
 	r := &ConjurSecretResource{}
 
