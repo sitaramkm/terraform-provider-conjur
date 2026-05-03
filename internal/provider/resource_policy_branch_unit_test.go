@@ -7,7 +7,6 @@ import (
 
 	"github.com/cyberark/conjur-api-go/conjurapi"
 	"github.com/cyberark/terraform-provider-conjur/internal/conjur/api/mocks"
-	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -25,25 +24,18 @@ func TestPolicyBranchResource_Create(t *testing.T) {
 		expectedError bool
 		errorContains string
 	}{
-
 		{
 			name: "successful branch creation",
 			data: ConjurPolicyBranchResourceModel{
 				Name:   types.StringValue("my-branch"),
 				Branch: types.StringValue("data/test"),
-				Owner: types.ObjectNull(map[string]attr.Type{
-					"kind": types.StringType,
-					"id":   types.StringType,
-				}),
-				Annotations: types.MapNull(types.StringType),
 			},
 			setupMock: func(mockV2 *mocks.MockClientV2) {
-				mockV2.On("CreateBranch", mock.MatchedBy(func(b conjurapi.Branch) bool {
-					return b.Name == "my-branch" && b.Branch == "data/test"
-				})).Return(&conjurapi.Branch{
-					Name:   "my-branch",
-					Branch: "data/test",
-				}, nil)
+				mockV2.On("LoadPolicy",
+					conjurapi.PolicyModePatch,
+					"data/test",
+					mock.AnythingOfType("*strings.Reader"),
+				).Return(&conjurapi.PolicyResponse{}, nil)
 			},
 			expectedError: false,
 		},
@@ -52,14 +44,13 @@ func TestPolicyBranchResource_Create(t *testing.T) {
 			data: ConjurPolicyBranchResourceModel{
 				Name:   types.StringValue("error-branch"),
 				Branch: types.StringValue("data/error"),
-				Owner: types.ObjectNull(map[string]attr.Type{
-					"kind": types.StringType,
-					"id":   types.StringType,
-				}),
-				Annotations: types.MapNull(types.StringType),
 			},
 			setupMock: func(mockV2 *mocks.MockClientV2) {
-				mockV2.On("CreateBranch", mock.Anything).Return(nil, fmt.Errorf("error creating branch"))
+				mockV2.On("LoadPolicy",
+					conjurapi.PolicyModePatch,
+					"data/error",
+					mock.AnythingOfType("*strings.Reader"),
+				).Return(nil, fmt.Errorf("error creating branch"))
 			},
 			expectedError: true,
 			errorContains: "Unable to create policy branch",
@@ -127,14 +118,10 @@ func TestPolicyBranchResource_Read(t *testing.T) {
 			data: ConjurPolicyBranchResourceModel{
 				Name:   types.StringValue("valid"),
 				Branch: types.StringValue("data/test"),
-				Owner: types.ObjectNull(map[string]attr.Type{
-					"kind": types.StringType,
-					"id":   types.StringType,
-				}),
-				Annotations: types.MapNull(types.StringType),
+				FullID: types.StringValue("data/test/valid"),
 			},
 			setupMock: func(mockV2 *mocks.MockClientV2) {
-				mockV2.On("ReadBranch", "data/test/valid").Return(&conjurapi.Branch{}, nil)
+				mockV2.On("ResourceExists", "policy:data/test/valid").Return(true, nil)
 			},
 		},
 		{
@@ -142,14 +129,10 @@ func TestPolicyBranchResource_Read(t *testing.T) {
 			data: ConjurPolicyBranchResourceModel{
 				Name:   types.StringValue("nonexistent"),
 				Branch: types.StringValue("data/test"),
-				Owner: types.ObjectNull(map[string]attr.Type{
-					"kind": types.StringType,
-					"id":   types.StringType,
-				}),
-				Annotations: types.MapNull(types.StringType),
+				FullID: types.StringValue("data/test/nonexistent"),
 			},
 			setupMock: func(mockV2 *mocks.MockClientV2) {
-				mockV2.On("ReadBranch", "data/test/nonexistent").Return(nil, fmt.Errorf("404 not found"))
+				mockV2.On("ResourceExists", "policy:data/test/nonexistent").Return(false, nil)
 			},
 		},
 		{
@@ -157,14 +140,10 @@ func TestPolicyBranchResource_Read(t *testing.T) {
 			data: ConjurPolicyBranchResourceModel{
 				Name:   types.StringValue("error-branch"),
 				Branch: types.StringValue("data/test"),
-				Owner: types.ObjectNull(map[string]attr.Type{
-					"kind": types.StringType,
-					"id":   types.StringType,
-				}),
-				Annotations: types.MapNull(types.StringType),
+				FullID: types.StringValue("data/test/error-branch"),
 			},
 			setupMock: func(mockV2 *mocks.MockClientV2) {
-				mockV2.On("ReadBranch", "data/test/error-branch").Return(nil, fmt.Errorf("connection refused"))
+				mockV2.On("ResourceExists", "policy:data/test/error-branch").Return(false, fmt.Errorf("connection refused"))
 			},
 			expectedError: true,
 			errorContains: "Unable to read policy branch",
@@ -229,16 +208,14 @@ func TestPolicyBranchResource_Delete(t *testing.T) {
 			data: ConjurPolicyBranchResourceModel{
 				Name:   types.StringValue("my-branch"),
 				Branch: types.StringValue("data/test"),
-				Owner: types.ObjectNull(map[string]attr.Type{
-					"kind": types.StringType,
-					"id":   types.StringType,
-				}),
-				Annotations: types.MapNull(types.StringType),
+				FullID: types.StringValue("data/test/my-branch"),
 			},
 			setupMock: func(mockV2 *mocks.MockClientV2) {
-				mockV2.On("DeleteBranch", mock.MatchedBy(func(fullID string) bool {
-					return fullID == "data/test/my-branch"
-				})).Return([]byte("data/test/my-branch"), nil)
+				mockV2.On("LoadPolicy",
+					conjurapi.PolicyModePatch,
+					"data/test",
+					mock.AnythingOfType("*strings.Reader"),
+				).Return(&conjurapi.PolicyResponse{}, nil)
 			},
 		},
 		{
@@ -246,14 +223,14 @@ func TestPolicyBranchResource_Delete(t *testing.T) {
 			data: ConjurPolicyBranchResourceModel{
 				Name:   types.StringValue("error-branch"),
 				Branch: types.StringValue("data/test"),
-				Owner: types.ObjectNull(map[string]attr.Type{
-					"kind": types.StringType,
-					"id":   types.StringType,
-				}),
-				Annotations: types.MapNull(types.StringType),
+				FullID: types.StringValue("data/test/error-branch"),
 			},
 			setupMock: func(mockV2 *mocks.MockClientV2) {
-				mockV2.On("DeleteBranch", mock.Anything).Return(nil, fmt.Errorf("permission denied"))
+				mockV2.On("LoadPolicy",
+					conjurapi.PolicyModePatch,
+					"data/test",
+					mock.AnythingOfType("*strings.Reader"),
+				).Return(nil, fmt.Errorf("permission denied"))
 			},
 			expectedError: true,
 			errorContains: "Unable to delete policy branch",
