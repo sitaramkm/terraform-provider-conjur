@@ -5,12 +5,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cyberark/conjur-api-go/conjurapi"
 	"github.com/cyberark/terraform-provider-conjur/internal/conjur/api"
 	"github.com/cyberark/terraform-provider-conjur/internal/policy"
 	"github.com/doodlesbykumbi/conjur-policy-go/pkg/conjurpolicy"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
-	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -179,18 +177,27 @@ func (r *ConjurSecretResource) Configure(ctx context.Context, req resource.Confi
 }
 
 func (r *ConjurSecretResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
-	var data ConjurSecretResourceModel
-	resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
+	// Use GetAttribute per-field rather than Get on the whole struct.
+	// req.Config.Get() silently fails to hydrate struct fields when a write-only
+	// attribute (value_wo) is set in the config, leaving them null. Create/Update
+	// already use GetAttribute for value_wo — this method must do the same.
+	var branch, name, value, valueWO types.String
+	var valueWOVersion types.Int32
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("branch"), &branch)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("name"), &name)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("value"), &value)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("value_wo"), &valueWO)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("value_wo_version"), &valueWOVersion)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	ValidateBranch(data.Branch, &resp.Diagnostics, "branch")
-	ValidateNonEmpty(data.Name, &resp.Diagnostics, "Secret name")
+	ValidateBranch(branch, &resp.Diagnostics, "branch")
+	ValidateNonEmpty(name, &resp.Diagnostics, "Secret name")
 
 	// Validate that value and value_wo are mutually exclusive
-	hasValue := !data.Value.IsNull() && !data.Value.IsUnknown()
-	hasValueWO := !data.ValueWO.IsNull() && !data.ValueWO.IsUnknown()
+	hasValue := !value.IsNull() && !value.IsUnknown()
+	hasValueWO := !valueWO.IsNull() && !valueWO.IsUnknown()
 	if hasValue && hasValueWO {
 		resp.Diagnostics.AddError(
 			"Invalid Attribute Combination",
@@ -199,8 +206,8 @@ func (r *ConjurSecretResource) ValidateConfig(ctx context.Context, req resource.
 	}
 
 	// Validate that value_wo_version requires value_wo
-	if !data.ValueWOVersion.IsNull() && !data.ValueWOVersion.IsUnknown() {
-		if data.ValueWO.IsNull() || data.ValueWO.IsUnknown() {
+	if !valueWOVersion.IsNull() && !valueWOVersion.IsUnknown() {
+		if valueWO.IsNull() || valueWO.IsUnknown() {
 			resp.Diagnostics.AddError(
 				"Invalid Attribute Combination",
 				"The 'value_wo_version' attribute requires 'value_wo' to be set. 'value_wo_version' is used together with 'value_wo' to trigger an update.",
@@ -221,39 +228,41 @@ func (r *ConjurSecretResource) Create(ctx context.Context, req resource.CreateRe
 		return
 	}
 
-	newSecret, err := r.buildSecretPayload(&data)
-	if err != nil {
-		resp.Diagnostics.AddError("Error Building Secret Payload", fmt.Sprintf("Could not build secret payload: %s", err))
-		return
-	}
-
 	// Read value_wo from Config (write-only attributes are in Config, not Plan)
 	var valueWO types.String
-	diags := req.Config.GetAttribute(ctx, path.Root("value_wo"), &valueWO)
-	resp.Diagnostics.Append(diags...)
-
-	// Add an indicator to the private state to determine whether we're using value or value_wo
-	if !valueWO.IsNull() {
-		if resp.Private != nil {
-			diags := resp.Private.SetKey(ctx, valueRWKey, []byte{})
-			resp.Diagnostics.Append(diags...)
-		}
-		newSecret.Value = valueWO.ValueString()
-	} else if !data.Value.IsNull() {
-		if resp.Private != nil {
-			diags := resp.Private.SetKey(ctx, valueRWKey, []byte("true"))
-			resp.Diagnostics.Append(diags...)
-		}
-	}
-
-	secretResp, err := r.client.CreateStaticSecret(newSecret)
-	if err != nil {
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to create secret, got error: %s", err))
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("value_wo"), &valueWO)...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	// Assume permissions in the model are correct since it was just created (otherwise we would need a separate request to evaluate them)
-	r.parseSecretResponse(*secretResp, conjurapi.PermissionResponse{}, &data)
+	// Set the secret value via the v1 secrets API.
+	// The variable must already exist in Conjur (declared by the admin workspace
+	// via `conjur-tf.sh admin-setup`) before a value can be stored.
+	branch := strings.TrimPrefix(data.Branch.ValueString(), "/")
+	secretID := branch + "/" + data.Name.ValueString()
+	usingValueWO := false
+	if !valueWO.IsNull() {
+		usingValueWO = true
+		if err := r.client.AddSecret(secretID, valueWO.ValueString()); err != nil {
+			resp.Diagnostics.AddError("Client Error",
+				fmt.Sprintf("Unable to set secret %q, got error: %s\n\nHint: run `conjur-tf.sh admin-setup` first to declare variables in the policy branch.", secretID, err))
+			return
+		}
+	} else if !data.Value.IsNull() {
+		if err := r.client.AddSecret(secretID, data.Value.ValueString()); err != nil {
+			resp.Diagnostics.AddError("Client Error",
+				fmt.Sprintf("Unable to set secret %q, got error: %s\n\nHint: run `conjur-tf.sh admin-setup` first to declare variables in the policy branch.", secretID, err))
+			return
+		}
+	}
+
+	if resp.Private != nil {
+		if usingValueWO {
+			resp.Diagnostics.Append(resp.Private.SetKey(ctx, valueRWKey, []byte{})...)
+		} else if !data.Value.IsNull() {
+			resp.Diagnostics.Append(resp.Private.SetKey(ctx, valueRWKey, []byte("true"))...)
+		}
+	}
 
 	tflog.Trace(ctx, "created secret resource")
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
@@ -266,37 +275,29 @@ func (r *ConjurSecretResource) Read(ctx context.Context, req resource.ReadReques
 	}
 	var data ConjurSecretResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
-	secretID := fmt.Sprintf("%s/%s", data.Branch.ValueString(), data.Name.ValueString())
-	secretResp, err := r.client.GetStaticSecretDetails(secretID)
+	branch := strings.TrimPrefix(data.Branch.ValueString(), "/")
+	secretID := branch + "/" + data.Name.ValueString()
+
+	exists, err := r.client.ResourceExists("variable:" + secretID)
 	if err != nil {
 		resp.Diagnostics.AddError(
-			"Error reading Secrets Manager secret",
+			"Error reading Conjur secret",
 			fmt.Sprintf("Unable to check if secret %q exists: %s", secretID, err),
 		)
 		return
 	}
-
-	// TODO: Computing this in Read when permissions have been applied via a different resource, i.e. conjur_permissions or in
-	// Secrets Manager directly causes there be a diff on permissions even if they are unchanged, resulting in unnecessary updates.
-	// permissionResp, err := r.client.GetStaticSecretPermissions(secretID)
-	// if err != nil {
-	// 	resp.Diagnostics.AddError(
-	// 		"Error reading Secrets Manager secret permissions",
-	// 		fmt.Sprintf("Unable to check if secret %q permissions exist: %s", secretID, err),
-	// 	)
-	// 	return
-	// }
-
-	err = r.parseSecretResponse(*secretResp, conjurapi.PermissionResponse{}, &data)
-	if err != nil {
-		resp.Diagnostics.AddError("Error Parsing Secret Response", fmt.Sprintf("Could not parse secret response: %s", err))
+	if !exists {
+		resp.State.RemoveResource(ctx)
 		return
 	}
 
 	// Determine if we should fetch the secret value:
 	// 1. If private state explicitly says "true" → fetch (using "value" attribute)
-	// 2. If private state is missing but value is already in config → fetch (likely imported/managed)
+	// 2. If private state is missing but value is already in state → fetch (likely imported)
 	// 3. Otherwise → skip fetch (using "value_wo" or not managing value)
 	valueRW, diags := req.Private.GetKey(ctx, valueRWKey)
 	resp.Diagnostics.Append(diags...)
@@ -305,15 +306,13 @@ func (r *ConjurSecretResource) Read(ctx context.Context, req resource.ReadReques
 	shouldFetchValue := hasPrivateStateMarker || (len(valueRW) == 0 && hasValueInState)
 
 	if shouldFetchValue {
-		secretValue, err := r.client.RetrieveSecret(strings.TrimPrefix(secretID, "/"))
+		secretValue, err := r.client.RetrieveSecret(secretID)
 		if err != nil {
 			resp.Diagnostics.AddWarning("Unable to fetch secret value", fmt.Sprintf("Could not fetch secret value for %q: %s", secretID, err))
 		} else {
 			data.Value = types.StringValue(string(secretValue))
-			// Set private state marker if it was missing (e.g., after import)
 			if len(valueRW) == 0 && resp.Private != nil {
-				diags := resp.Private.SetKey(ctx, valueRWKey, []byte("true"))
-				resp.Diagnostics.Append(diags...)
+				resp.Diagnostics.Append(resp.Private.SetKey(ctx, valueRWKey, []byte("true"))...)
 			}
 		}
 	}
@@ -409,90 +408,6 @@ func (r *ConjurSecretResource) ImportState(ctx context.Context, req resource.Imp
 
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), name)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("branch"), branch)...)
-}
-
-// buildSecretPayload maps the resource model to an API payload
-func (r *ConjurSecretResource) buildSecretPayload(data *ConjurSecretResourceModel) (conjurapi.StaticSecret, error) {
-	// Initialize with required fields
-	secret := conjurapi.StaticSecret{
-		Name:   data.Name.ValueString(),
-		Branch: data.Branch.ValueString(),
-	}
-
-	// Supply optional attributes only if provided
-	if !data.MimeType.IsNull() && !data.MimeType.IsUnknown() {
-		secret.MimeType = data.MimeType.ValueString()
-	}
-	if !data.Value.IsNull() && !data.Value.IsUnknown() {
-		secret.Value = data.Value.ValueString()
-	}
-	if len(data.Permissions) > 0 {
-		permissions := make([]conjurapi.Permission, len(data.Permissions))
-		for i, v := range data.Permissions {
-			permission := conjurapi.Permission{}
-			if v.Subject.Id.ValueString() != "" && v.Subject.Kind.ValueString() != "" {
-				permission.Subject = conjurapi.Subject{
-					Id:   v.Subject.Id.ValueString(),
-					Kind: v.Subject.Kind.ValueString(),
-				}
-			}
-			if len(v.Privileges.Elements()) > 0 {
-				privileges := make([]string, len(v.Privileges.Elements()))
-				for j, p := range v.Privileges.Elements() {
-					privileges[j] = p.(types.String).ValueString()
-				}
-				permission.Privileges = privileges
-			}
-			permissions[i] = permission
-		}
-		secret.Permissions = permissions
-	}
-
-	if len(data.Annotations) > 0 {
-		secret.Annotations = data.Annotations
-	}
-
-	return secret, nil
-}
-
-func (r *ConjurSecretResource) parseSecretResponse(secretResp conjurapi.StaticSecretResponse, permissionResp conjurapi.PermissionResponse, data *ConjurSecretResourceModel) error {
-	data.Name = types.StringValue(secretResp.Name)
-	data.Branch = types.StringValue(secretResp.Branch)
-	if secretResp.MimeType == "" {
-		data.MimeType = types.StringNull()
-	} else {
-		data.MimeType = types.StringValue(secretResp.MimeType)
-	}
-
-	if len(permissionResp.Permission) > 0 {
-		permissions := make([]ConjurSecretPermission, len(permissionResp.Permission))
-		for i, v := range permissionResp.Permission {
-			permission := ConjurSecretPermission{}
-			if v.Subject.Id != "" && v.Subject.Kind != "" {
-				permission.Subject = ConjurSecretSubject{
-					Id:   types.StringValue(v.Subject.Id),
-					Kind: types.StringValue(v.Subject.Kind),
-				}
-			}
-			if len(v.Privileges) > 0 {
-				privileges := make([]attr.Value, len(v.Privileges))
-				for j, p := range v.Privileges {
-					privileges[j] = types.StringValue(p)
-				}
-				permission.Privileges = types.ListValueMust(types.StringType, privileges)
-			} else {
-				permission.Privileges = types.ListNull(types.StringType)
-			}
-			permissions[i] = permission
-		}
-		data.Permissions = permissions
-	}
-
-	if len(secretResp.Annotations) != 0 {
-		data.Annotations = secretResp.Annotations
-	}
-
-	return nil
 }
 
 func (r *ConjurSecretResource) generateSecretDeletionPolicy(data *ConjurSecretResourceModel) (string, error) {

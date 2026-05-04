@@ -14,6 +14,14 @@ func ValidateBranch(branch types.String, diagnostics *diag.Diagnostics, fieldNam
 		return
 	}
 
+	// Unknown values occur when Terraform re-runs validation during planning
+	// (e.g. when write-only attributes are present). Skip rather than error —
+	// Required: true on the schema ensures non-null is enforced by Terraform.
+	// This mirrors the pattern in ValidateNonEmpty.
+	if branch.IsNull() || branch.IsUnknown() {
+		return
+	}
+
 	branchValue := branch.ValueString()
 
 	normalized := strings.Trim(branchValue, "/")

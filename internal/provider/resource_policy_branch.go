@@ -5,17 +5,17 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cyberark/conjur-api-go/conjurapi"
 	"github.com/cyberark/terraform-provider-conjur/internal/conjur/api"
-	"github.com/hashicorp/terraform-plugin-framework/attr"
+	internalpolicy "github.com/cyberark/terraform-provider-conjur/internal/policy"
+	"github.com/doodlesbykumbi/conjur-policy-go/pkg/conjurpolicy"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/mapplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"gopkg.in/yaml.v3"
 )
 
 var _ resource.Resource = &ConjurPolicyBranchResource{}
@@ -32,11 +32,9 @@ type ConjurPolicyBranchResource struct {
 }
 
 type ConjurPolicyBranchResourceModel struct {
-	Name        types.String `tfsdk:"name"`
-	Branch      types.String `tfsdk:"branch"`
-	Owner       types.Object `tfsdk:"owner"`
-	Annotations types.Map    `tfsdk:"annotations"`
-	FullID      types.String `tfsdk:"full_id"`
+	Name   types.String `tfsdk:"name"`
+	Branch types.String `tfsdk:"branch"`
+	FullID types.String `tfsdk:"full_id"`
 }
 
 func (r *ConjurPolicyBranchResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -59,38 +57,6 @@ func (r *ConjurPolicyBranchResource) Schema(ctx context.Context, req resource.Sc
 				Required:            true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
-				},
-			},
-			"owner": schema.SingleNestedAttribute{
-				MarkdownDescription: "Owner of the policy branch",
-				Optional:            true,
-				Computed:            true,
-				Attributes: map[string]schema.Attribute{
-					"kind": schema.StringAttribute{
-						MarkdownDescription: "Owner kind (user, group, etc.)",
-						Optional:            true,
-						Computed:            true,
-						PlanModifiers: []planmodifier.String{
-							stringplanmodifier.RequiresReplace(),
-						},
-					},
-					"id": schema.StringAttribute{
-						MarkdownDescription: "Owner identifier",
-						Optional:            true,
-						Computed:            true,
-						PlanModifiers: []planmodifier.String{
-							stringplanmodifier.RequiresReplace(),
-						},
-					},
-				},
-			},
-			"annotations": schema.MapAttribute{
-				MarkdownDescription: "Key-value annotations for the policy branch",
-				Optional:            true,
-				Computed:            true,
-				ElementType:         types.StringType,
-				PlanModifiers: []planmodifier.Map{
-					mapplanmodifier.RequiresReplace(),
 				},
 			},
 			"full_id": schema.StringAttribute{
@@ -142,47 +108,23 @@ func (r *ConjurPolicyBranchResource) Create(ctx context.Context, req resource.Cr
 	leaf := strings.Trim(data.Name.ValueString(), "/")
 	fullID := joinPath(parent, leaf)
 
-	tflog.Debug(ctx, fmt.Sprintf("Creating policy branch: parent=%q, leaf=%q", parent, leaf))
+	tflog.Debug(ctx, fmt.Sprintf("Creating policy branch via policy API: parent=%q, leaf=%q", parent, leaf))
 
-	payload := conjurapi.Branch{
-		Branch: parent,
-		Name:   leaf,
-	}
-
-	if !data.Owner.IsNull() && !data.Owner.IsUnknown() {
-		payload.Owner = &conjurapi.Owner{
-			Kind: data.Owner.Attributes()["kind"].(types.String).ValueString(),
-			Id:   data.Owner.Attributes()["id"].(types.String).ValueString(),
-		}
-	}
-
-	if !data.Annotations.IsNull() && !data.Annotations.IsUnknown() {
-		var anns map[string]string
-		resp.Diagnostics.Append(data.Annotations.ElementsAs(ctx, &anns, false)...)
-		if len(anns) > 0 {
-			payload.Annotations = anns
-		}
-	}
-
-	created, err := r.client.CreateBranch(payload)
+	policyYAML, err := buildBranchCreatePolicy(leaf)
 	if err != nil {
-		tflog.Error(ctx, fmt.Sprintf("CreateBranch failed: %s", err))
+		resp.Diagnostics.AddError("Error Building Policy", fmt.Sprintf("Unable to build policy for branch %q: %s", leaf, err))
+		return
+	}
+
+	if err := internalpolicy.ApplyPolicy(r.client, policyYAML, parent); err != nil {
+		tflog.Error(ctx, fmt.Sprintf("ApplyPolicy failed for branch creation: %s", err))
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to create policy branch: %s", err))
 		return
 	}
 
-	data.Name = types.StringValue(created.Name)
+	data.Name = types.StringValue(leaf)
 	data.Branch = types.StringValue(parent)
 	data.FullID = types.StringValue(fullID)
-	data.Owner = ownerToObject(created.Owner)
-
-	if created.Annotations != nil {
-		mv, diags := types.MapValueFrom(ctx, types.StringType, created.Annotations)
-		resp.Diagnostics.Append(diags...)
-		data.Annotations = mv
-	} else {
-		data.Annotations = types.MapNull(types.StringType)
-	}
 
 	tflog.Trace(ctx, "Created policy branch resource")
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
@@ -205,35 +147,26 @@ func (r *ConjurPolicyBranchResource) Read(ctx context.Context, req resource.Read
 
 	tflog.Debug(ctx, fmt.Sprintf("Reading branch: parent=%q, leaf=%q, fullID=%q", parent, leaf, fullID))
 
-	br, err := r.client.ReadBranch(fullID)
-	if isNotFoundErr(err) {
-		resp.State.RemoveResource(ctx)
-		return
-	}
+	exists, err := r.client.ResourceExists("policy:" + fullID)
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read policy branch %q: %s", fullID, err))
 		return
 	}
 
-	data.Name = types.StringValue(br.Name)
+	if !exists {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+
+	data.Name = types.StringValue(leaf)
 	data.Branch = types.StringValue(parent)
 	data.FullID = types.StringValue(fullID)
-
-	data.Owner = ownerToObject(br.Owner)
-
-	if br.Annotations != nil {
-		mv, diags := types.MapValueFrom(ctx, types.StringType, br.Annotations)
-		resp.Diagnostics.Append(diags...)
-		data.Annotations = mv
-	} else {
-		data.Annotations = types.MapNull(types.StringType)
-	}
 
 	tflog.Trace(ctx, "Read policy branch resource")
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
-// Not supported in CC - requires resource recreation via planmodifiers since there's no PATCH support in the API
+// Not supported - requires resource recreation via planmodifiers since there's no PATCH support in the API
 func (r *ConjurPolicyBranchResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	if r.client == nil {
 		AddProviderClientNotConfiguredWarning(&resp.Diagnostics)
@@ -262,8 +195,15 @@ func (r *ConjurPolicyBranchResource) Delete(ctx context.Context, req resource.De
 
 	tflog.Debug(ctx, fmt.Sprintf("Deleting branch: parent=%q, leaf=%q, fullID=%q", parent, leaf, fullID))
 
-	if _, err := r.client.DeleteBranch(fullID); err != nil {
+	policyYAML, err := buildBranchDeletePolicy(leaf)
+	if err != nil {
+		resp.Diagnostics.AddError("Error Building Policy", fmt.Sprintf("Unable to build delete policy for branch %q: %s", leaf, err))
+		return
+	}
+
+	if err := internalpolicy.ApplyPolicy(r.client, policyYAML, parent); err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to delete policy branch %q: %s", fullID, err))
+		return
 	}
 
 	tflog.Trace(ctx, "Deleted policy branch resource")
@@ -283,6 +223,32 @@ func (r *ConjurPolicyBranchResource) ImportState(ctx context.Context, req resour
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), name)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("full_id"), id)...)
 }
+
+func buildBranchCreatePolicy(leaf string) (string, error) {
+	p := conjurpolicy.Policy{Id: leaf}
+	statements := conjurpolicy.PolicyStatements{p}
+	yamlBytes, err := yaml.Marshal(statements)
+	if err != nil {
+		return "", err
+	}
+	return string(yamlBytes), nil
+}
+
+func buildBranchDeletePolicy(leaf string) (string, error) {
+	del := conjurpolicy.Delete{
+		Record: conjurpolicy.ResourceRef{
+			Kind: conjurpolicy.KindPolicy,
+			Id:   leaf,
+		},
+	}
+	statements := conjurpolicy.PolicyStatements{del}
+	yamlBytes, err := yaml.Marshal(statements)
+	if err != nil {
+		return "", err
+	}
+	return string(yamlBytes), nil
+}
+
 func joinPath(parent, leaf string) string {
 	parent = strings.Trim(parent, "/")
 	leaf = strings.Trim(leaf, "/")
@@ -307,24 +273,4 @@ func isNotFoundErr(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "404") || strings.Contains(msg, "not found")
-}
-
-func ownerToObject(owner *conjurapi.Owner) types.Object {
-	if owner == nil {
-		return types.ObjectNull(map[string]attr.Type{
-			"kind": types.StringType,
-			"id":   types.StringType,
-		})
-	}
-	obj, _ := types.ObjectValue(
-		map[string]attr.Type{
-			"kind": types.StringType,
-			"id":   types.StringType,
-		},
-		map[string]attr.Value{
-			"kind": types.StringValue(owner.Kind),
-			"id":   types.StringValue(owner.Id),
-		},
-	)
-	return obj
 }
